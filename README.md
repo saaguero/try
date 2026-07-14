@@ -184,6 +184,38 @@ export TRY_PATH=~/code/sketches
 
 Default: `~/src/tries`
 
+### Multiple tries directories (`TRY_PATHS`)
+
+This fork adds `TRY_PATHS`: a colon-separated list of tries directories that are
+shown together in one unified, fuzzy-searchable list.
+
+```bash
+export TRY_PATHS=~/tries:~/tries-work
+```
+
+- **Unified view** — every directory from every path appears in the same list.
+  When more than one path is configured, each entry is tagged on the left with
+  its source directory's name (e.g. `[tries]`, `[tries-work]`).
+- **First path is the default** — `Ctrl-T` and typing a name then pressing
+  `Enter` create the new try in the first path.
+- **Pick a destination** — when you type a name, the list shows one
+  `Create in [tag]` line per path; select the one you want.
+- **Per-path graduate/delete** — graduating (`Ctrl-G`) defaults to the parent of
+  that entry's own source path, and deletes are validated against the path each
+  entry actually came from.
+
+`TRY_PATHS` takes precedence over `TRY_PATH`; if `TRY_PATHS` is unset, `TRY_PATH`
+(then `~/src/tries`) is used, so existing setups keep working unchanged.
+
+**Example — temporarily narrow the view:** since the paths are just an env
+var, you can show only a subset of your tries in a given shell by dropping
+paths from `TRY_PATHS` — no files are moved:
+
+```bash
+export TRY_PATHS=~/tries                 # show only these
+export TRY_PATHS=~/tries:~/tries-work    # show everything again
+```
+
 ## Nix
 
 ### Quick start

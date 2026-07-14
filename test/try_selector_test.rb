@@ -380,3 +380,179 @@ class FinalizeRenameTest < TrySelectorTestCase
     assert_equal "brand-new", selected[:new]
   end
 end
+
+# -------------------------------------------------------------------
+# Multiple TRY_PATHS support
+# -------------------------------------------------------------------
+class MultiplePathsTest < Minitest::Test
+  def setup
+    @colors_were_enabled = Tui.colors_enabled?
+    @dir_a = Dir.mktmpdir("try_a")
+    @dir_b = Dir.mktmpdir("try_b")
+  end
+
+  def teardown
+    Tui.colors_enabled = @colors_were_enabled
+    [@dir_a, @dir_b].each { |d| FileUtils.rm_rf(d) if d && Dir.exist?(d) }
+  end
+
+  def multi_selector(**opts)
+    TrySelector.new("", base_paths: [@dir_a, @dir_b],
+                    test_render_once: true, test_no_cls: true, **opts)
+  end
+
+  # --- split_paths -------------------------------------------------
+  def test_split_paths_colon_separated
+    result = TrySelector.split_paths("#{@dir_a}:#{@dir_b}")
+    assert_equal [@dir_a, @dir_b], result
+  end
+
+  def test_split_paths_single
+    assert_equal [@dir_a], TrySelector.split_paths(@dir_a)
+  end
+
+  def test_split_paths_expands_and_dedupes
+    result = TrySelector.split_paths("#{@dir_a}:#{@dir_a}: ")
+    assert_equal [@dir_a], result
+  end
+
+  def test_split_paths_empty
+    assert_equal [], TrySelector.split_paths("")
+    assert_equal [], TrySelector.split_paths(nil)
+  end
+
+  # --- base path resolution ---------------------------------------
+  def test_base_path_still_accepted_single
+    sel = TrySelector.new("", base_path: @dir_a, test_render_once: true, test_no_cls: true)
+    assert_equal @dir_a, sel.instance_variable_get(:@base_path)
+    assert_equal [@dir_a], sel.instance_variable_get(:@base_paths)
+    refute sel.instance_variable_get(:@multi_path)
+  end
+
+  def test_base_path_colon_separated_string
+    sel = TrySelector.new("", base_path: "#{@dir_a}:#{@dir_b}", test_render_once: true, test_no_cls: true)
+    assert_equal [@dir_a, @dir_b], sel.instance_variable_get(:@base_paths)
+    assert_equal @dir_a, sel.instance_variable_get(:@base_path)
+    assert sel.instance_variable_get(:@multi_path)
+  end
+
+  def test_first_path_is_default
+    sel = multi_selector
+    assert_equal @dir_a, sel.instance_variable_get(:@base_path)
+  end
+
+  # --- load_all_tries across paths --------------------------------
+  def test_loads_from_all_paths_with_tags
+    FileUtils.mkdir_p(File.join(@dir_a, "alpha"))
+    FileUtils.mkdir_p(File.join(@dir_b, "beta"))
+    sel = multi_selector
+    tries = sel.send(:load_all_tries)
+    names = tries.map { |t| t[:basename] }
+    assert_includes names, "alpha"
+    assert_includes names, "beta"
+    alpha = tries.find { |t| t[:basename] == "alpha" }
+    beta  = tries.find { |t| t[:basename] == "beta" }
+    assert_equal @dir_a, alpha[:try_path]
+    assert_equal @dir_b, beta[:try_path]
+    assert_equal File.basename(@dir_a), alpha[:try_tag]
+    assert_equal File.basename(@dir_b), beta[:try_tag]
+  end
+
+  def test_same_name_in_two_paths_both_present
+    FileUtils.mkdir_p(File.join(@dir_a, "wifi"))
+    FileUtils.mkdir_p(File.join(@dir_b, "wifi"))
+    sel = multi_selector
+    tries = sel.send(:load_all_tries).select { |t| t[:basename] == "wifi" }
+    assert_equal 2, tries.length
+    assert_equal [@dir_a, @dir_b].sort, tries.map { |t| t[:try_path] }.sort
+  end
+
+  # --- tag disambiguation -----------------------------------------
+  def test_colliding_basenames_first_stays_bare
+    Dir.mktmpdir do |root|
+      p1 = File.join(root, "one", "tries")
+      p2 = File.join(root, "two", "tries")
+      FileUtils.mkdir_p(p1)
+      FileUtils.mkdir_p(p2)
+      sel = TrySelector.new("", base_paths: [p1, p2], test_render_once: true, test_no_cls: true)
+      tags = sel.send(:compute_path_tags, [p1, p2])
+      # First path keeps the bare basename; the later duplicate is prefixed.
+      assert_equal "tries", tags[p1]
+      assert_equal File.join("two", "tries"), tags[p2]
+    end
+  end
+
+  def test_tags_mirror_personal_and_work_layout
+    # ~/tries + ~/work/tries -> [tries] and [work/tries]
+    Dir.mktmpdir do |home|
+      personal = File.join(home, "tries")
+      work = File.join(home, "work", "tries")
+      FileUtils.mkdir_p(personal)
+      FileUtils.mkdir_p(work)
+      sel = TrySelector.new("", base_paths: [personal, work], test_render_once: true, test_no_cls: true)
+      tags = sel.send(:compute_path_tags, [personal, work])
+      assert_equal "tries", tags[personal]
+      assert_equal File.join("work", "tries"), tags[work]
+    end
+  end
+
+  # --- missing secondary paths are skipped, never recreated -------
+  def test_missing_secondary_path_is_dropped
+    missing = File.join(@dir_b, "gone")  # does not exist
+    sel = TrySelector.new("", base_paths: [@dir_a, missing], test_render_once: true, test_no_cls: true)
+    assert_equal [@dir_a], sel.instance_variable_get(:@base_paths)
+    refute sel.instance_variable_get(:@multi_path)
+    refute Dir.exist?(missing), "missing secondary path must not be recreated"
+  end
+
+  def test_present_secondary_path_is_kept
+    sel = TrySelector.new("", base_paths: [@dir_a, @dir_b], test_render_once: true, test_no_cls: true)
+    assert_equal [@dir_a, @dir_b], sel.instance_variable_get(:@base_paths)
+    assert sel.instance_variable_get(:@multi_path)
+  end
+
+  def test_missing_default_path_is_created
+    Dir.mktmpdir do |root|
+      first = File.join(root, "fresh-default")
+      refute Dir.exist?(first)
+      TrySelector.new("", base_paths: [first], test_render_once: true, test_no_cls: true)
+      assert Dir.exist?(first), "default (first) path should be created if missing"
+    end
+  end
+
+  # --- create routing ---------------------------------------------
+  def test_create_new_targets_given_path
+    sel = multi_selector
+    sel.instance_variable_set(:@input_buffer, "myproject")
+    sel.send(:handle_create_new, @dir_b)
+    selected = sel.instance_variable_get(:@selected)
+    assert_equal :mkdir, selected[:type]
+    assert selected[:path].start_with?(@dir_b + "/"),
+      "expected create under #{@dir_b}, got #{selected[:path]}"
+    assert_match(/\d{4}-\d{2}-\d{2}-myproject\z/, selected[:path])
+  end
+
+  def test_create_new_defaults_to_first_path
+    sel = multi_selector
+    sel.instance_variable_set(:@input_buffer, "myproject")
+    sel.send(:handle_create_new)
+    assert sel.instance_variable_get(:@selected)[:path].start_with?(@dir_a + "/")
+  end
+
+  # --- delete validates against each entry's own path -------------
+  def test_delete_validates_per_path
+    FileUtils.mkdir_p(File.join(@dir_a, "keep-a"))
+    FileUtils.mkdir_p(File.join(@dir_b, "keep-b"))
+    sel = multi_selector
+    marked = [
+      { path: File.join(@dir_a, "keep-a"), basename: "keep-a", try_path: @dir_a },
+      { path: File.join(@dir_b, "keep-b"), basename: "keep-b", try_path: @dir_b },
+    ]
+    sel.send(:process_delete_confirmation, marked, "YES")
+    selected = sel.instance_variable_get(:@selected)
+    assert_equal :delete, selected[:type]
+    bases = selected[:paths].map { |p| p[:base_path] }
+    assert_includes bases, File.realpath(@dir_a)
+    assert_includes bases, File.realpath(@dir_b)
+  end
+end

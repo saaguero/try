@@ -4,7 +4,7 @@
 - `try.rb`: Single-file Ruby CLI and TUI (no gems).
 - `flake.nix`/`flake.lock`: Nix packaging and Home Manager module.
 - `README.md`: Usage, installation, and philosophy.
-- Tries live outside this repo (default `~/src/tries`, configurable via `TRY_PATH`).
+- Tries live outside this repo (default `~/src/tries`, configurable via `TRY_PATH`, or a colon-separated list via `TRY_PATHS`).
 
 ## CLI Interface
 - `try init [PATH]`: Emits a tiny shell wrapper function for your shell. PATH sets the root (absolute path recommended). The function evals the printed, shell-neutral script to `cd` into selections.
@@ -12,8 +12,8 @@
 - `try . [name]`: Shorthand to create a date-prefixed directory and, if inside a Git repo, add a detached worktree. Optional `name` overrides the basename.
 - `try worktree dir [name]`: Same as above but explicit CLI, useful without the shell wrapper.
 - `try clone <git-uri> [name]`: Clones into the root. Default name is `YYYY-MM-DD-user-repo` (strips `.git`). Optional `name` overrides.
-- Flags: `--path PATH` (for `cd`/`clone`) overrides the root for that call; `--help` prints global help.
-- Environment: `TRY_PATH` sets the default root when not using `--path`. `TRY_PROJECTS` sets the graduate destination (default: parent of `TRY_PATH`).
+- Flags: `--path PATH` (for `cd`/`clone`) overrides the root for that call and accepts a colon-separated list of roots; `--help` prints global help.
+- Environment: `TRY_PATHS` sets a colon-separated list of roots shown in one unified list (first is the default for new tries); `TRY_PATH` sets a single root and is used as a fallback when `TRY_PATHS` is unset. `TRY_PROJECTS` sets the graduate destination (default: parent of the selected try's own root).
 - UI keys: `↑/↓` or `Ctrl-P/N` navigate, `Enter` select, `Backspace` delete char, `Ctrl-D` delete dir (requires typing `YES`), `Ctrl-G` graduate (promote try to project), `Ctrl-R` rename, `ESC` cancel.
 
 ### Shorthands and Worktrees

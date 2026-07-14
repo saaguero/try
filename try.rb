@@ -12,11 +12,18 @@ class TrySelector
   TRY_PATH = ENV['TRY_PATH'] || File.expand_path("~/src/tries")
   TRY_PROJECTS = ENV['TRY_PROJECTS']
 
+  # Split a colon-separated list of directories into expanded, unique
+  # absolute paths. Backward compatible with a single path (no colon).
+  def self.split_paths(raw)
+    return [] if raw.nil? || raw.empty?
+    raw.split(':').map(&:strip).reject(&:empty?).map { |p| File.expand_path(p) }.uniq
+  end
+
   # Precompiled regex constants
   INPUT_CHAR_RE = /[a-zA-Z0-9\-\_\. ]/
   WORD_CHAR_RE = /[a-zA-Z0-9]/
 
-  def initialize(search_term = "", base_path: TRY_PATH, initial_input: nil, test_render_once: false, test_no_cls: false, test_keys: nil, test_confirm: nil)
+  def initialize(search_term = "", base_path: nil, base_paths: nil, initial_input: nil, test_render_once: false, test_no_cls: false, test_keys: nil, test_confirm: nil)
     @search_term = search_term.gsub(/\s+/, '-')
     @cursor_pos = 0  # Navigation cursor (list position)
     @input_cursor_pos = 0  # Text cursor (position within search buffer)
@@ -25,7 +32,16 @@ class TrySelector
     @input_cursor_pos = @input_buffer.length  # Start at end of buffer
     @selected = nil
     @all_trials = nil  # Memoized trials
-    @base_path = base_path
+    @base_paths = resolve_base_paths(base_paths, base_path)
+    # The default (first) path is the target for new tries, so ensure it exists.
+    FileUtils.mkdir_p(@base_paths.first) unless Dir.exist?(@base_paths.first)
+    # Secondary paths that don't exist are skipped entirely — never recreated.
+    # This means a path can be hidden by simply moving it out of the way,
+    # without try recreating an empty directory in its place.
+    @base_paths = [@base_paths.first] + @base_paths.drop(1).select { |p| Dir.exist?(p) }
+    @base_path = @base_paths.first  # Default destination for new tries
+    @multi_path = @base_paths.length > 1
+    @path_tags = compute_path_tags(@base_paths)
     @delete_status = nil  # Status message for deletions
     @delete_mode = false  # Whether we're in deletion mode
     @marked_for_deletion = []  # Paths marked for deletion
@@ -36,8 +52,37 @@ class TrySelector
     @test_confirm = test_confirm
     @old_winch_handler = nil  # Store original SIGWINCH handler
     @needs_redraw = false
+  end
 
-    FileUtils.mkdir_p(@base_path) unless Dir.exist?(@base_path)
+  # Resolve the list of base paths from the (possibly colon-separated) inputs.
+  # Accepts base_paths as an Array or String, or a single base_path string.
+  # Falls back to TRY_PATH when nothing usable is given.
+  def resolve_base_paths(base_paths, base_path)
+    list = case base_paths
+    when Array then base_paths.flat_map { |p| self.class.split_paths(p) }
+    when String then self.class.split_paths(base_paths)
+    else
+      base_path ? self.class.split_paths(base_path) : []
+    end
+    list = list.uniq
+    list.empty? ? [File.expand_path(TRY_PATH)] : list
+  end
+
+  # Build a display tag per base path (its basename). On a basename collision
+  # the FIRST path keeps the bare basename (it's the default, and stays clean)
+  # and later duplicates are disambiguated by prefixing the parent dir name —
+  # e.g. ~/tries + ~/work/tries render as [tries] and [work/tries].
+  def compute_path_tags(paths)
+    seen = {}
+    paths.each_with_object({}) do |p, tags|
+      base = File.basename(p)
+      tags[p] = if seen[base]
+        File.join(File.basename(File.dirname(p)), base)
+      else
+        seen[base] = true
+        base
+      end
+    end
   end
 
   def run
@@ -96,40 +141,46 @@ class TrySelector
     @all_tries ||= begin
       tries = []
       now = Time.now
-      Dir.foreach(@base_path) do |entry|
-        # exclude . and .. but also .git, and any other hidden dirs.
-        next if entry.start_with?('.')
+      @base_paths.each do |base|
+        tag = @path_tags[base]
+        next unless Dir.exist?(base)
+        Dir.foreach(base) do |entry|
+          # exclude . and .. but also .git, and any other hidden dirs.
+          next if entry.start_with?('.')
 
-        path = File.join(@base_path, entry)
-        begin
-          stat = File.stat(path)
-        rescue Errno::ENOENT, Errno::EACCES
-          next
+          path = File.join(base, entry)
+          begin
+            stat = File.stat(path)
+          rescue Errno::ENOENT, Errno::EACCES
+            next
+          end
+
+          # Only include directories
+          next unless stat.directory?
+
+          # Compute base_score from recency + date prefix bonus
+          mtime = stat.mtime
+          hours_since_access = (now - mtime) / 3600.0
+          base_score = 3.0 / Math.sqrt(hours_since_access + 1)
+
+          # Bonus for date-prefixed directories
+          base_score += 2.0 if entry.match?(/^\d{4}-\d{2}-\d{2}-/)
+
+          is_symlink = File.symlink?(path)
+
+          tries << {
+            text: entry,
+            basename: entry,
+            path: is_symlink ? File.realpath(path) : path,
+            try_path: base,
+            try_tag: tag,
+            is_new: false,
+            is_symlink: is_symlink,
+            ctime: stat.ctime,
+            mtime: mtime,
+            base_score: base_score
+          }
         end
-
-        # Only include directories
-        next unless stat.directory?
-
-        # Compute base_score from recency + date prefix bonus
-        mtime = stat.mtime
-        hours_since_access = (now - mtime) / 3600.0
-        base_score = 3.0 / Math.sqrt(hours_since_access + 1)
-
-        # Bonus for date-prefixed directories
-        base_score += 2.0 if entry.match?(/^\d{4}-\d{2}-\d{2}-/)
-
-        is_symlink = File.symlink?(path)
-
-        tries << {
-          text: entry,
-          basename: entry,
-          path: is_symlink ? File.realpath(path) : path,
-          is_new: false,
-          is_symlink: is_symlink,
-          ctime: stat.ctime,
-          mtime: mtime,
-          base_score: base_score
-        }
       end
       tries
     end
@@ -177,7 +228,7 @@ class TrySelector
     loop do
       tries = get_tries
       show_create_new = !@input_buffer.empty?
-      total_items = tries.length + (show_create_new ? 1 : 0)
+      total_items = tries.length + (show_create_new ? @base_paths.length : 0)
 
       # Ensure cursor is within bounds
       @cursor_pos = [[@cursor_pos, 0].max, [total_items - 1, 0].max].min
@@ -198,8 +249,9 @@ class TrySelector
           handle_selection(tries[@cursor_pos])
           break if @selected
         elsif show_create_new
-          # Selected "Create new"
-          handle_create_new
+          # Selected one of the "Create in <path>" lines
+          base_index = @cursor_pos - tries.length
+          handle_create_new(@base_paths[base_index] || @base_path)
           break if @selected
         end
       when "\e[A", "\x10"  # Up arrow or Ctrl-P
@@ -362,7 +414,7 @@ class TrySelector
     footer_lines = screen.footer.lines.length
     max_visible = [height - header_lines - footer_lines, 3].max
     show_create_new = !@input_buffer.empty?
-    total_items = tries.length + (show_create_new ? 1 : 0)
+    total_items = tries.length + (show_create_new ? @base_paths.length : 0)
 
     if @cursor_pos < @scroll_offset
       @scroll_offset = @cursor_pos
@@ -380,7 +432,7 @@ class TrySelector
       if idx < tries.length
         render_entry_line(screen, tries[idx], idx == @cursor_pos, width)
       else
-        render_create_line(screen, idx == @cursor_pos, width)
+        render_create_line(screen, idx == @cursor_pos, width, idx - tries.length)
       end
     end
 
@@ -407,8 +459,16 @@ class TrySelector
     end
     line.write << icon << " "
 
+    # In multi-path mode, tag each entry with its source directory
+    tag_width = 0
+    if @multi_path
+      tag_str = "[#{entry[:try_tag]}] "
+      line.write << Tui::Text.dim(tag_str)
+      tag_width = Tui::Metrics.visible_width(tag_str)
+    end
+
     plain_name, rendered_name = formatted_entry_name(entry)
-    prefix_width = 5
+    prefix_width = 5 + tag_width
     meta_text = "#{format_relative_time(entry[:mtime])}, #{format('%.1f', entry[:score])}"
 
     # Only truncate name if it exceeds total line width (not to make room for metadata)
@@ -425,17 +485,18 @@ class TrySelector
     line.right.write_dim(meta_text)
   end
 
-  def render_create_line(screen, is_selected, width)
+  def render_create_line(screen, is_selected, width, base_index = 0)
     background = is_selected ? Tui::Palette::SELECTED_BG : nil
     line = screen.body.add_line(background: background)
     line.write << (is_selected ? Tui::Text.highlight("→ ") : "  ")
     date_prefix = Time.now.strftime("%Y-%m-%d")
-    label = if @input_buffer.empty?
-      "📂 Create new: #{date_prefix}-"
+    suffix = @input_buffer.empty? ? "#{date_prefix}-" : "#{date_prefix}-#{@input_buffer}"
+    if @multi_path
+      base = @base_paths[base_index] || @base_path
+      line.write << "📂 Create in [#{@path_tags[base]}]: #{suffix}"
     else
-      "📂 Create new: #{date_prefix}-#{@input_buffer}"
+      line.write << "📂 Create new: #{suffix}"
     end
-    line.write << label
   end
 
   def formatted_entry_name(entry)
@@ -651,11 +712,13 @@ class TrySelector
     # Strip date prefix for the default project name
     project_name = current_name.sub(/^\d{4}-\d{2}-\d{2}-/, '')
 
-    # Compute default destination directory
+    # Compute default destination directory (relative to the entry's own
+    # source path, so multi-path graduates land next to their tries dir)
+    entry_base = entry[:try_path] || @base_path
     projects_dir = if TRY_PROJECTS
       File.expand_path(TRY_PROJECTS)
     else
-      File.dirname(@base_path)
+      File.dirname(entry_base)
     end
 
     ascend_buffer = File.join(projects_dir, project_name)
@@ -772,7 +835,7 @@ class TrySelector
       source: entry[:path],
       dest: dest,
       basename: entry[:basename],
-      base_path: @base_path
+      base_path: entry[:try_path] || @base_path
     }
     true
   end
@@ -782,14 +845,14 @@ class TrySelector
     @selected = { type: :cd, path: try_dir[:path] }
   end
 
-  def handle_create_new
-    # Create new try directory
+  def handle_create_new(base = @base_path)
+    # Create new try directory (in the given base path; defaults to the first)
     date_prefix = Time.now.strftime("%Y-%m-%d")
 
     # If user already typed a name, use it directly
     if !@input_buffer.empty?
       final_name = "#{date_prefix}-#{@input_buffer}".gsub(/\s+/, '-')
-      full_path = File.join(@base_path, final_name)
+      full_path = File.join(base, final_name)
       @selected = { type: :mkdir, path: full_path }
     else
       # No name typed, prompt for one
@@ -813,7 +876,7 @@ class TrySelector
       return if entry.nil? || entry.empty?
 
       final_name = "#{date_prefix}-#{entry}".gsub(/\s+/, '-')
-      full_path = File.join(@base_path, final_name)
+      full_path = File.join(base, final_name)
 
       @selected = { type: :mkdir, path: full_path }
       end
@@ -919,20 +982,19 @@ class TrySelector
   def process_delete_confirmation(marked_items, confirmation)
     if confirmation == "YES"
       begin
-        base_real = File.realpath(@base_path)
-
-        # Validate all paths first
+        # Validate all paths first, each against its own source base path
         validated_paths = []
         marked_items.each do |item|
+          base_real = File.realpath(item[:try_path] || @base_path)
           target_real = File.realpath(item[:path])
           unless target_real.start_with?(base_real + "/")
             raise "Safety check failed: #{target_real} is not inside #{base_real}"
           end
-          validated_paths << { path: target_real, basename: item[:basename] }
+          validated_paths << { path: target_real, basename: item[:basename], base_path: base_real }
         end
 
         # Return delete action with all paths
-        @selected = { type: :delete, paths: validated_paths, base_path: base_real }
+        @selected = { type: :delete, paths: validated_paths, base_path: validated_paths.first[:base_path] }
         names = validated_paths.map { |p| p[:basename] }.join(", ")
         @delete_status = "Deleted: #{names}"
         @all_tries = nil  # Clear cache
@@ -990,8 +1052,11 @@ if __FILE__ == $0
         try exec [query]      Output shell script to eval
 
       Environment:
-        TRY_PATH          Tries directory (default: ~/src/tries)
-        TRY_PROJECTS      Graduate destination (default: parent of TRY_PATH)
+        TRY_PATHS         Colon-separated list of tries directories (unified
+                          view; first path is the default for new tries)
+        TRY_PATH          Single tries directory (fallback if TRY_PATHS unset;
+                          default: ~/src/tries)
+        TRY_PROJECTS      Graduate destination (default: parent of the try's path)
 
       Keyboard:
         ↑/↓, Ctrl-P/N     Navigate
@@ -1077,9 +1142,15 @@ if __FILE__ == $0
     arg.match?(%r{^(https?://|git@)}) || arg.include?('github.com') || arg.include?('gitlab.com') || arg.end_with?('.git')
   end
 
-  # Extract all options BEFORE getting command (they can appear anywhere)
-  tries_path = extract_option_with_value!(ARGV, '--path') || TrySelector::TRY_PATH
-  tries_path = File.expand_path(tries_path)
+  # Extract all options BEFORE getting command (they can appear anywhere).
+  # --path accepts a colon-separated list of directories (TRY_PATHS style);
+  # falls back to $TRY_PATHS, then $TRY_PATH, then the built-in default.
+  raw_tries_path = extract_option_with_value!(ARGV, '--path') ||
+    ENV['TRY_PATHS'] || ENV['TRY_PATH'] || TrySelector::TRY_PATH
+  tries_paths = TrySelector.split_paths(raw_tries_path)
+  tries_paths = [File.expand_path(TrySelector::TRY_PATH)] if tries_paths.empty?
+  # Primary path: default for clone/worktree/init and non-interactive shorthands
+  tries_path = tries_paths.first
 
   # Test-only flags (undocumented; aid acceptance tests)
   # Must be extracted before command shift since they can come before command
@@ -1265,7 +1336,7 @@ if __FILE__ == $0
   def init_snippet(shell, script_path, explicit_path, default_path)
     case shell
     when 'fish'
-      fish_path_arg = explicit_path ? " --path '#{explicit_path}'" : " --path (if set -q TRY_PATH; echo \"$TRY_PATH\"; else; echo '#{default_path}'; end)"
+      fish_path_arg = explicit_path ? " --path '#{explicit_path}'" : " --path (if set -q TRY_PATHS; echo \"$TRY_PATHS\"; else if set -q TRY_PATH; echo \"$TRY_PATH\"; else; echo '#{default_path}'; end)"
       <<~FISH
         function try
           set -l out (/usr/bin/env ruby '#{script_path}' exec#{fish_path_arg} $argv 2>/dev/tty | string collect)
@@ -1280,7 +1351,7 @@ if __FILE__ == $0
       ps_path_expr = if explicit_path
         "'#{explicit_path}'"
       else
-        "$(if ($env:TRY_PATH) { $env:TRY_PATH } else { '#{default_path}' })"
+        "$(if ($env:TRY_PATHS) { $env:TRY_PATHS } elseif ($env:TRY_PATH) { $env:TRY_PATH } else { '#{default_path}' })"
       end
       <<~PWSH
         function try {
@@ -1297,7 +1368,7 @@ if __FILE__ == $0
         }
       PWSH
     else # bash, zsh
-      path_arg = explicit_path ? " --path '#{explicit_path}'" : " --path \"${TRY_PATH:-#{default_path}}\""
+      path_arg = explicit_path ? " --path '#{explicit_path}'" : " --path \"${TRY_PATHS:-${TRY_PATH:-#{default_path}}}\""
       <<~SH
         try() {
           local out
@@ -1312,7 +1383,10 @@ if __FILE__ == $0
     end
   end
 
-  def cmd_cd!(args, tries_path, and_type, and_exit, and_keys, and_confirm)
+  def cmd_cd!(args, tries_paths, and_type, and_exit, and_keys, and_confirm)
+    # Primary path for non-interactive shorthands (clone / try . / git url).
+    # The interactive selector receives the full list.
+    tries_path = tries_paths.first
     if args.first == "clone"
       return cmd_clone!(args[1..-1] || [], tries_path)
     end
@@ -1361,7 +1435,7 @@ if __FILE__ == $0
     # Regular interactive selector
     selector = TrySelector.new(
       search_term,
-      base_path: tries_path,
+      base_paths: tries_paths,
       initial_input: and_type,
       test_render_once: and_exit,
       test_no_cls: (and_exit || (and_keys && !and_keys.empty?)),
@@ -1432,8 +1506,16 @@ if __FILE__ == $0
   end
 
   def script_delete(paths, base_path)
-    cmds = ["cd #{q(base_path)}"]
-    paths.each { |item| cmds << "test -d #{q(item[:basename])} && rm -rf #{q(item[:basename])}" }
+    cmds = []
+    current_base = nil
+    paths.each do |item|
+      item_base = item[:base_path] || base_path
+      if item_base != current_base
+        cmds << "cd #{q(item_base)}"
+        current_base = item_base
+      end
+      cmds << "test -d #{q(item[:basename])} && rm -rf #{q(item[:basename])}"
+    end
     cmds << "cd #{q(Dir.pwd)} 2>/dev/null || cd #{q(base_path)}"
     cmds
   end
@@ -1549,7 +1631,7 @@ if __FILE__ == $0
       emit_script(script_worktree(full_path, repo_dir == Dir.pwd ? nil : repo_dir))
     when 'cd'
       ARGV.shift
-      script = cmd_cd!(ARGV, tries_path, and_type, and_exit, and_keys, and_confirm)
+      script = cmd_cd!(ARGV, tries_paths, and_type, and_exit, and_keys, and_confirm)
       if script
         emit_script(script)
         exit 0
@@ -1558,7 +1640,7 @@ if __FILE__ == $0
         exit 1
       end
     else
-      script = cmd_cd!(ARGV, tries_path, and_type, and_exit, and_keys, and_confirm)
+      script = cmd_cd!(ARGV, tries_paths, and_type, and_exit, and_keys, and_confirm)
       if script
         emit_script(script)
         exit 0
@@ -1576,7 +1658,7 @@ if __FILE__ == $0
     exit 0
   else
     # Default: try [query] - same as try exec [query]
-    script = cmd_cd!(ARGV.unshift(command), tries_path, and_type, and_exit, and_keys, and_confirm)
+    script = cmd_cd!(ARGV.unshift(command), tries_paths, and_type, and_exit, and_keys, and_confirm)
     if script
       emit_script(script)
       exit 0
